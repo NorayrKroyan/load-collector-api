@@ -2,22 +2,41 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\LoadImportJob;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\DB;
 
 class ImportJobsController extends Controller
 {
+    /**
+     * Return the list of import jobs that the external collector should process.
+     *
+     * Final logic:
+     * - source of truth is the physical MySQL table `loadimport_jobs`
+     * - this endpoint does not read from any SQL view
+     *
+     * Response shape:
+     * {
+     *   "items": [
+     *     {
+     *       "jobname": "Example Job",
+     *       "signature": []
+     *     }
+     *   ]
+     * }
+     */
     public function list(): JsonResponse
     {
-        // Read from MySQL VIEW (no more fake_jobs table)
-        $rows = DB::table('view_propx_import_jobs')->get(['job_name']);
+        $rows = LoadImportJob::query()
+            ->orderBy('jobname')
+            ->get(['jobname', 'signature']);
 
-        // { jobname, signature: [] }
-        $items = $rows->map(fn ($r) => [
-            'jobname'    => $r->job_name,
-            'signature'  => [],
+        $items = $rows->map(fn (LoadImportJob $row) => [
+            'jobname' => $row->jobname,
+            'signature' => is_array($row->signature) ? $row->signature : [],
         ])->values();
 
-        return response()->json(['items' => $items]);
+        return response()->json([
+            'items' => $items,
+        ]);
     }
 }
