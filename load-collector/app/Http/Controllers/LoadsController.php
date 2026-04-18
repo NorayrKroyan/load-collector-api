@@ -5,183 +5,492 @@ namespace App\Http\Controllers;
 use App\Models\LoadImport;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
+use RuntimeException;
+use Throwable;
 
 class LoadsController extends Controller
 {
     /**
-     * Central storage disk used by this ingestion endpoint.
-     *
-     * This stays hard-coded to preserve the current production behavior exactly.
-     * Future refactors could move this into config/env, but that is intentionally
-     * not done here to avoid changing runtime behavior during handoff.
+     * Storage disk used for archived incoming files.
      */
     private const STORAGE_DISK = 'local';
 
     /**
-     * Top-level directory under the selected storage disk.
-     *
-     * Final writes go into:
-     *   loadimports/YYYY-MM-DD/<generated-file-name>
-     *
-     * Example stored relative path:
-     *   loadimports/2026-03-09/uuid__order.json
+     * Base folder for archived payloads/images.
+     * Example: loadimports/2026-03-09/uuid__payload.json
      */
     private const STORAGE_BASE_DIR = 'loadimports';
 
     /**
      * Accept one incoming load package and store it for downstream processing.
      *
-     * Expected request type:
-     * - multipart/form-data
-     *
-     * Accepted fields:
-     * - payload  (required)
-     *      Can be either:
-     *      1. an uploaded JSON file
-     *      2. a raw JSON string sent in the form field
-     *
-     * - bolimage (optional)
-     *      An uploaded image file associated with the load/BOL.
-     *
-     * Primary responsibilities of this method:
-     * 1. validate the request
-     * 2. determine the daily storage directory
-     * 3. persist the payload file (or generate one from raw JSON)
-     * 4. decode JSON and store it into `payload_json`
-     * 5. optionally persist the image file
-     * 6. insert one row into the `loadimports` table
-     * 7. return the inserted row ID
-     *
-     * Important design choice:
-     * The payload is stored in two ways on purpose:
-     * - as a file on disk (`payload_path`) for audit/replay/debug purposes
-     * - as decoded JSON in the database (`payload_json`) for quick inspection and search
+     * Supported payload modes:
+     * 1. uploaded JSON file
+     * 2. raw JSON string form field
      */
     public function push(Request $request): JsonResponse
     {
-        // Validate the request before performing any application logic.
-        // `payload` is mandatory because this API is fundamentally a payload ingestion endpoint.
-        // `bolimage` is optional and capped at 8 MB to avoid unexpectedly large uploads.
-        $request->validate([
+        $requestId = (string) Str::uuid();
+
+        Log::info('[loads.push] request received', $this->baseLogContext($request, $requestId));
+
+        $validator = Validator::make($request->all(), [
             'payload' => ['required'],
             'bolimage' => ['nullable', 'file', 'image', 'max:8192'],
         ]);
 
-        // Store incoming files under a date-partitioned folder.
-        // This keeps raw ingestion files organized by day and simplifies manual inspection.
-        $dir = self::STORAGE_BASE_DIR . '/' . now()->format('Y-m-d');
+        if ($validator->fails()) {
+            Log::warning('[loads.push] validation failed', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'errors' => $validator->errors()->toArray(),
+                    'payload_has_file' => $request->hasFile('payload'),
+                    'bolimage_has_file' => $request->hasFile('bolimage'),
+                    'payload_file' => $request->hasFile('payload')
+                        ? $this->fileSummary($request->file('payload'))
+                        : null,
+                    'bolimage_file' => $request->hasFile('bolimage')
+                        ? $this->fileSummary($request->file('bolimage'))
+                        : null,
+                ]
+            ));
 
-        // ---------------------------
-        // Payload bookkeeping fields
-        // ---------------------------
-        // These values will eventually be persisted into `loadimports`.
-        $payloadPath = null;
-        $payloadOriginal = null;
-        $payloadSize = null;
-        $payloadJson = null;
-
-        if ($request->file('payload')) {
-            // ------------------------------------------------------------
-            // Mode A: `payload` was uploaded as a physical JSON file.
-            // ------------------------------------------------------------
-            $f = $request->file('payload');
-            $payloadOriginal = $f->getClientOriginalName();
-            $payloadSize = $f->getSize();
-
-            // Prefix the original name with a UUID to avoid filename collisions.
-            $name = Str::uuid()->toString() . '__' . ($payloadOriginal ?: 'payload.json');
-
-            // Store the file on the configured disk and keep only the relative path in DB.
-            $payloadPath = $f->storeAs($dir, $name, self::STORAGE_DISK);
-
-            // Read the stored file back from disk and decode it to structured JSON.
-            // This ensures the database has a searchable JSON copy of the exact stored content.
-            $raw = Storage::disk(self::STORAGE_DISK)->get($payloadPath);
-            $payloadJson = json_decode($raw, true);
-        } else {
-            // ------------------------------------------------------------
-            // Mode B: `payload` was provided as a raw form value instead of a file.
-            // ------------------------------------------------------------
-            $rawInput = $request->input('payload');
-
-            // Support both cases:
-            // - client sends a JSON string directly
-            // - framework/input normalization already turned the payload into an array
-            $raw = is_array($rawInput)
-                ? json_encode($rawInput, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
-                : (string) $rawInput;
-
-            $payloadJson = json_decode($raw, true);
-
-            // For consistency, even non-file payloads are still written to disk so the ingestion
-            // system always has a file artifact corresponding to each database row.
-            $payloadOriginal = 'payload.json';
-            $name = Str::uuid()->toString() . '__payload.json';
-            $payloadPath = $dir . '/' . $name;
-
-            Storage::disk(self::STORAGE_DISK)->put($payloadPath, $raw);
-            $payloadSize = strlen($raw);
-        }
-
-        // Reject malformed JSON. The endpoint is specifically for JSON load payloads,
-        // so it is better to fail fast than to store ambiguous/unusable data.
-        //
-        // Note:
-        // json_decode('null', true) returns null with JSON_ERROR_NONE, which is valid JSON.
-        // This guard intentionally only rejects true decode errors.
-        if ($payloadJson === null && json_last_error() !== JSON_ERROR_NONE) {
             return response()->json([
                 'ok' => false,
-                'error' => 'Invalid JSON in payload',
+                'error' => 'Validation failed',
+                'errors' => $validator->errors(),
+                'request_id' => $requestId,
             ], 422);
         }
 
-        // Extract `jobname` from the top-level JSON object when present.
-        // This value is duplicated into a first-class column because it is operationally useful
-        // for browsing/filtering rows without opening the full JSON.
-        $jobname = is_array($payloadJson) ? ($payloadJson['jobname'] ?? null) : null;
+        try {
+            $dir = self::STORAGE_BASE_DIR . '/' . now()->format('Y-m-d');
 
-        // --------------------------
-        // Optional image bookkeeping
-        // --------------------------
-        $imagePath = null;
-        $imageOriginal = null;
-        $imageSize = null;
+            $payloadPath = null;
+            $payloadOriginal = null;
+            $payloadSize = null;
+            $payloadJson = null;
+            $payloadMode = null;
+            $raw = null;
 
-        if ($request->file('bolimage')) {
-            // Persist the optional BOL image to the same date-based directory as the payload.
-            // Keeping related files together simplifies support and downstream reconciliation.
-            $img = $request->file('bolimage');
-            $imageOriginal = $img->getClientOriginalName();
-            $imageSize = $img->getSize();
+            if ($request->hasFile('payload')) {
+                $payloadMode = 'file';
 
-            $imgName = Str::uuid()->toString() . '__' . ($imageOriginal ?: 'bolimage.jpg');
-            $imagePath = $img->storeAs($dir, $imgName, self::STORAGE_DISK);
+                /** @var UploadedFile $file */
+                $file = $request->file('payload');
+
+                $payloadOriginal = $file->getClientOriginalName();
+                $payloadSize = $file->getSize();
+
+                $name = Str::uuid()->toString() . '__' . ($payloadOriginal ?: 'payload.json');
+                $payloadPath = $this->storeUploadedFileOrFail(
+                    $file,
+                    $dir,
+                    $name,
+                    'payload',
+                    $request,
+                    $requestId
+                );
+
+                $raw = $this->readStoredFileOrFail(
+                    $payloadPath,
+                    'payload',
+                    $request,
+                    $requestId
+                );
+            } else {
+                $payloadMode = 'text';
+
+                $rawInput = $request->input('payload');
+                $raw = is_array($rawInput)
+                    ? json_encode($rawInput, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+                    : (string) $rawInput;
+
+                $payloadOriginal = 'payload.json';
+                $name = Str::uuid()->toString() . '__payload.json';
+                $payloadPath = $dir . '/' . $name;
+
+                $this->storeTextContentsOrFail(
+                    $payloadPath,
+                    $raw,
+                    'payload',
+                    $request,
+                    $requestId
+                );
+
+                // Robin requirement: if we cannot read it back from disk, fail.
+                $raw = $this->readStoredFileOrFail(
+                    $payloadPath,
+                    'payload',
+                    $request,
+                    $requestId
+                );
+
+                $payloadSize = strlen($raw);
+            }
+
+            $rawBeforeNormalize = $raw;
+            $raw = $this->normalizeJsonInput($raw);
+
+            $payloadJson = json_decode($raw, true);
+            $jsonError = json_last_error();
+            $jsonErrorMessage = json_last_error_msg();
+
+            if ($payloadJson === null && $jsonError !== JSON_ERROR_NONE) {
+                Log::error('[loads.push] invalid JSON payload', array_merge(
+                    $this->baseLogContext($request, $requestId),
+                    [
+                        'payload_mode' => $payloadMode,
+                        'payload_path' => $payloadPath,
+                        'payload_original' => $payloadOriginal,
+                        'payload_size' => $payloadSize,
+                        'json_error_code' => $jsonError,
+                        'json_error_message' => $jsonErrorMessage,
+                        'raw_prefix_hex_before_normalize' => bin2hex(substr((string) $rawBeforeNormalize, 0, 16)),
+                        'raw_prefix_hex_after_normalize' => bin2hex(substr((string) $raw, 0, 16)),
+                        'raw_preview_before_normalize' => $this->preview($rawBeforeNormalize),
+                        'raw_preview_after_normalize' => $this->preview($raw),
+                        'payload_file' => $request->hasFile('payload')
+                            ? $this->fileSummary($request->file('payload'))
+                            : null,
+                    ]
+                ));
+
+                return response()->json([
+                    'ok' => false,
+                    'error' => 'Invalid JSON in payload',
+                    'request_id' => $requestId,
+                ], 422);
+            }
+
+            $jobname = is_array($payloadJson) ? ($payloadJson['jobname'] ?? null) : null;
+
+            $imagePath = null;
+            $imageOriginal = null;
+            $imageSize = null;
+
+            if ($request->hasFile('bolimage')) {
+                /** @var UploadedFile $img */
+                $img = $request->file('bolimage');
+
+                $imageOriginal = $img->getClientOriginalName();
+                $imageSize = $img->getSize();
+
+                $imgName = Str::uuid()->toString() . '__' . ($imageOriginal ?: 'bolimage.jpg');
+                $imagePath = $this->storeUploadedFileOrFail(
+                    $img,
+                    $dir,
+                    $imgName,
+                    'bolimage',
+                    $request,
+                    $requestId
+                );
+
+                $this->assertStoredFileReadableOrFail(
+                    $imagePath,
+                    'bolimage',
+                    $request,
+                    $requestId
+                );
+            }
+
+            $row = LoadImport::create([
+                'jobname' => $jobname,
+                'payload_path' => $payloadPath,
+                'payload_original' => $payloadOriginal,
+                'payload_size' => $payloadSize,
+                'image_path' => $imagePath,
+                'image_original' => $imageOriginal,
+                'image_size' => $imageSize,
+                'payload_json' => $payloadJson,
+            ]);
+
+            Log::info('[loads.push] load stored', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'payload_mode' => $payloadMode,
+                    'row_id' => $row->id,
+                    'jobname' => $jobname,
+                    'payload_path' => $payloadPath,
+                    'image_path' => $imagePath,
+                ]
+            ));
+
+            return response()->json([
+                'ok' => true,
+                'id' => $row->id,
+                'request_id' => $requestId,
+            ], 201);
+        } catch (Throwable $e) {
+            Log::error('[loads.push] unhandled exception', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'exception_class' => $e::class,
+                    'exception_message' => $e->getMessage(),
+                    'exception_file' => $e->getFile(),
+                    'exception_line' => $e->getLine(),
+                ]
+            ));
+
+            return response()->json([
+                'ok' => false,
+                'error' => 'Server error while processing payload',
+                'request_id' => $requestId,
+            ], 500);
+        }
+    }
+
+    private function storeUploadedFileOrFail(
+        UploadedFile $file,
+        string $dir,
+        string $name,
+        string $field,
+        Request $request,
+        string $requestId
+    ): string {
+        $storedPath = $file->storeAs($dir, $name, self::STORAGE_DISK);
+
+        if (!is_string($storedPath) || $storedPath === '') {
+            Log::error('[loads.push] failed to store uploaded file', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'target_dir' => $dir,
+                    'target_name' => $name,
+                    'stored_path' => $storedPath,
+                    'file' => $this->fileSummary($file),
+                ]
+            ));
+
+            throw new RuntimeException("Failed to store {$field}");
         }
 
-        // Insert one row that represents one ingestion event.
-        // This table is intentionally append-only in behavior from the controller perspective:
-        // every accepted API call results in a fresh row.
-        $row = LoadImport::create([
-            'jobname' => $jobname,
+        if (!Storage::disk(self::STORAGE_DISK)->exists($storedPath)) {
+            Log::error('[loads.push] uploaded file reported stored but does not exist on disk', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'stored_path' => $storedPath,
+                    'target_dir' => $dir,
+                    'target_name' => $name,
+                    'file' => $this->fileSummary($file),
+                ]
+            ));
 
-            'payload_path' => $payloadPath,
-            'payload_original' => $payloadOriginal,
-            'payload_size' => $payloadSize,
+            throw new RuntimeException("Stored {$field} path does not exist on disk");
+        }
 
-            'image_path' => $imagePath,
-            'image_original' => $imageOriginal,
-            'image_size' => $imageSize,
+        return $storedPath;
+    }
 
-            'payload_json' => $payloadJson,
-        ]);
+    private function storeTextContentsOrFail(
+        string $path,
+        string $contents,
+        string $field,
+        Request $request,
+        string $requestId
+    ): void {
+        $stored = Storage::disk(self::STORAGE_DISK)->put($path, $contents);
 
-        // Return the inserted row ID so the client or operator can trace the upload later.
-        return response()->json([
-            'ok' => true,
-            'id' => $row->id,
-        ], 201);
+        if ($stored !== true) {
+            Log::error('[loads.push] failed to store text contents', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'target_path' => $path,
+                    'content_size' => strlen($contents),
+                    'content_preview' => $this->preview($contents),
+                ]
+            ));
+
+            throw new RuntimeException("Failed to store {$field}");
+        }
+
+        if (!Storage::disk(self::STORAGE_DISK)->exists($path)) {
+            Log::error('[loads.push] text contents reported stored but do not exist on disk', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'target_path' => $path,
+                    'content_size' => strlen($contents),
+                ]
+            ));
+
+            throw new RuntimeException("Stored {$field} path does not exist on disk");
+        }
+    }
+
+    private function readStoredFileOrFail(
+        string $path,
+        string $field,
+        Request $request,
+        string $requestId
+    ): string {
+        if (!Storage::disk(self::STORAGE_DISK)->exists($path)) {
+            Log::error('[loads.push] cannot read back stored file because path does not exist', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'path' => $path,
+                ]
+            ));
+
+            throw new RuntimeException("Stored {$field} file is missing");
+        }
+
+        try {
+            $contents = Storage::disk(self::STORAGE_DISK)->get($path);
+        } catch (Throwable $e) {
+            Log::error('[loads.push] failed reading stored file back from disk', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'path' => $path,
+                    'exception_class' => $e::class,
+                    'exception_message' => $e->getMessage(),
+                ]
+            ));
+
+            throw new RuntimeException("Unable to read stored {$field} file");
+        }
+
+        if (!is_string($contents)) {
+            Log::error('[loads.push] read-back returned non-string contents', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'path' => $path,
+                    'contents_type' => gettype($contents),
+                ]
+            ));
+
+            throw new RuntimeException("Stored {$field} file is not readable");
+        }
+
+        return $contents;
+    }
+
+    private function assertStoredFileReadableOrFail(
+        string $path,
+        string $field,
+        Request $request,
+        string $requestId
+    ): void {
+        if (!Storage::disk(self::STORAGE_DISK)->exists($path)) {
+            Log::error('[loads.push] cannot verify stored file because path does not exist', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'path' => $path,
+                ]
+            ));
+
+            throw new RuntimeException("Stored {$field} file is missing");
+        }
+
+        try {
+            $stream = Storage::disk(self::STORAGE_DISK)->readStream($path);
+        } catch (Throwable $e) {
+            Log::error('[loads.push] failed opening stored file for read-back verification', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'path' => $path,
+                    'exception_class' => $e::class,
+                    'exception_message' => $e->getMessage(),
+                ]
+            ));
+
+            throw new RuntimeException("Unable to read stored {$field} file");
+        }
+
+        if (!is_resource($stream)) {
+            Log::error('[loads.push] read-back verification returned invalid stream', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'path' => $path,
+                ]
+            ));
+
+            throw new RuntimeException("Stored {$field} file is not readable");
+        }
+
+        $probe = fread($stream, 1);
+        fclose($stream);
+
+        if ($probe === false) {
+            Log::error('[loads.push] stored file stream could not be read', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'path' => $path,
+                ]
+            ));
+
+            throw new RuntimeException("Stored {$field} file is not readable");
+        }
+    }
+
+    private function normalizeJsonInput(?string $raw): string
+    {
+        $raw = (string) $raw;
+
+        // Strip UTF-8 BOM if present.
+        if (strncmp($raw, "\xEF\xBB\xBF", 3) === 0) {
+            $raw = substr($raw, 3);
+        }
+
+        return $raw;
+    }
+
+    private function baseLogContext(Request $request, string $requestId): array
+    {
+        return [
+            'request_id' => $requestId,
+            'method' => $request->method(),
+            'path' => $request->path(),
+            'content_type' => $request->header('Content-Type'),
+            'accept' => $request->header('Accept'),
+            'user_agent' => $request->userAgent(),
+            'ip' => $request->ip(),
+            'expects_json' => $request->expectsJson(),
+            'wants_json' => $request->wantsJson(),
+            'has_payload_file' => $request->hasFile('payload'),
+            'has_bolimage_file' => $request->hasFile('bolimage'),
+        ];
+    }
+
+    private function fileSummary(?UploadedFile $file): ?array
+    {
+        if (!$file) {
+            return null;
+        }
+
+        return [
+            'original_name' => $file->getClientOriginalName(),
+            'client_mime' => $file->getClientMimeType(),
+            'server_mime' => $file->getMimeType(),
+            'size' => $file->getSize(),
+            'is_valid' => $file->isValid(),
+            'error' => $file->getError(),
+            'error_message' => $file->getErrorMessage(),
+        ];
+    }
+
+    private function preview(?string $value, int $limit = 500): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $value = str_replace(["\r", "\n"], ['\r', '\n'], $value);
+
+        return Str::limit($value, $limit, '...');
     }
 }
