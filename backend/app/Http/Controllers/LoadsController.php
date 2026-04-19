@@ -187,7 +187,15 @@ class LoadsController extends Controller
 
             /*
              * Only store files after dedupe check passes.
+             * Important: verify the exact dated target directory is writable first.
              */
+            $this->assertTargetDirectoryWritableOrFail(
+                $dir,
+                'payload',
+                $request,
+                $requestId
+            );
+
             if ($request->hasFile('payload')) {
                 /** @var UploadedFile $file */
                 $file = $request->file('payload');
@@ -233,6 +241,13 @@ class LoadsController extends Controller
             $imageSize = null;
 
             if ($request->hasFile('bolimage')) {
+                $this->assertTargetDirectoryWritableOrFail(
+                    $dir,
+                    'bolimage',
+                    $request,
+                    $requestId
+                );
+
                 /** @var UploadedFile $img */
                 $img = $request->file('bolimage');
 
@@ -374,6 +389,67 @@ class LoadsController extends Controller
         }
 
         return $this->canonicalizeJsonValue($value);
+    }
+
+    private function assertTargetDirectoryWritableOrFail(
+        string $dir,
+        string $field,
+        Request $request,
+        string $requestId
+    ): void {
+        $disk = Storage::disk(self::STORAGE_DISK);
+        $absoluteDir = $disk->path($dir);
+
+        if (!is_dir($absoluteDir)) {
+            $created = @mkdir($absoluteDir, 0775, true);
+
+            clearstatcache(true, $absoluteDir);
+
+            if (!$created && !is_dir($absoluteDir)) {
+                Log::error('[loads.push] target directory could not be created', array_merge(
+                    $this->baseLogContext($request, $requestId),
+                    [
+                        'field' => $field,
+                        'dir' => $dir,
+                        'absolute_dir' => $absoluteDir,
+                    ]
+                ));
+
+                throw new RuntimeException("Target {$field} directory could not be created");
+            }
+        }
+
+        clearstatcache(true, $absoluteDir);
+
+        if (!is_dir($absoluteDir) || !is_readable($absoluteDir) || !is_writable($absoluteDir)) {
+            Log::error('[loads.push] target directory is not writable/readable', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'dir' => $dir,
+                    'absolute_dir' => $absoluteDir,
+                    'is_dir' => is_dir($absoluteDir),
+                    'is_readable' => is_readable($absoluteDir),
+                    'is_writable' => is_writable($absoluteDir),
+                    'perms_octal' => $this->octalPerms($absoluteDir),
+                    'owner_uid' => @fileowner($absoluteDir),
+                    'group_gid' => @filegroup($absoluteDir),
+                ]
+            ));
+
+            throw new RuntimeException("Target {$field} directory is not writable");
+        }
+    }
+
+    private function octalPerms(string $path): ?string
+    {
+        $perms = @fileperms($path);
+
+        if ($perms === false) {
+            return null;
+        }
+
+        return substr(sprintf('%o', $perms), -4);
     }
 
     private function storeUploadedFileOrFail(
@@ -665,7 +741,6 @@ class LoadsController extends Controller
     {
         $raw = (string) $raw;
 
-        // Strip UTF-8 BOM if present.
         if (strncmp($raw, "\xEF\xBB\xBF", 3) === 0) {
             $raw = substr($raw, 3);
         }
