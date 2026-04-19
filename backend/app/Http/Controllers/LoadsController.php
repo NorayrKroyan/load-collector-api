@@ -78,6 +78,9 @@ class LoadsController extends Controller
             $payloadMode = null;
             $raw = null;
 
+            /*
+             * Read payload first so we can dedupe before writing files or inserting rows.
+             */
             if ($request->hasFile('payload')) {
                 $payloadMode = 'file';
 
@@ -86,19 +89,8 @@ class LoadsController extends Controller
 
                 $payloadOriginal = $file->getClientOriginalName();
                 $payloadSize = $file->getSize();
-
-                $name = Str::uuid()->toString() . '__' . ($payloadOriginal ?: 'payload.json');
-                $payloadPath = $this->storeUploadedFileOrFail(
+                $raw = $this->readUploadedFileContentsOrFail(
                     $file,
-                    $dir,
-                    $name,
-                    'payload',
-                    $request,
-                    $requestId
-                );
-
-                $raw = $this->readStoredFileOrFail(
-                    $payloadPath,
                     'payload',
                     $request,
                     $requestId
@@ -112,25 +104,6 @@ class LoadsController extends Controller
                     : (string) $rawInput;
 
                 $payloadOriginal = 'payload.json';
-                $name = Str::uuid()->toString() . '__payload.json';
-                $payloadPath = $dir . '/' . $name;
-
-                $this->storeTextContentsOrFail(
-                    $payloadPath,
-                    $raw,
-                    'payload',
-                    $request,
-                    $requestId
-                );
-
-                // Robin requirement: if we cannot read it back from disk, fail.
-                $raw = $this->readStoredFileOrFail(
-                    $payloadPath,
-                    'payload',
-                    $request,
-                    $requestId
-                );
-
                 $payloadSize = strlen($raw);
             }
 
@@ -146,7 +119,6 @@ class LoadsController extends Controller
                     $this->baseLogContext($request, $requestId),
                     [
                         'payload_mode' => $payloadMode,
-                        'payload_path' => $payloadPath,
                         'payload_original' => $payloadOriginal,
                         'payload_size' => $payloadSize,
                         'json_error_code' => $jsonError,
@@ -169,6 +141,92 @@ class LoadsController extends Controller
             }
 
             $jobname = is_array($payloadJson) ? ($payloadJson['jobname'] ?? null) : null;
+            $canonicalPayloadJson = $this->canonicalizeJsonValue($payloadJson);
+
+            $incomingImageHash = null;
+            $incomingImageSize = null;
+
+            if ($request->hasFile('bolimage')) {
+                /** @var UploadedFile $img */
+                $img = $request->file('bolimage');
+                $incomingImageSize = $img->getSize();
+                $incomingImageHash = $this->hashUploadedFileOrFail(
+                    $img,
+                    'bolimage',
+                    $request,
+                    $requestId
+                );
+            }
+
+            $existing = $this->findDuplicateImport(
+                $jobname,
+                $canonicalPayloadJson,
+                $incomingImageHash,
+                $incomingImageSize
+            );
+
+            if ($existing) {
+                Log::info('[loads.push] duplicate payload skipped', array_merge(
+                    $this->baseLogContext($request, $requestId),
+                    [
+                        'existing_row_id' => $existing->id,
+                        'jobname' => $jobname,
+                        'payload_mode' => $payloadMode,
+                        'incoming_image_size' => $incomingImageSize,
+                        'incoming_image_hash' => $incomingImageHash,
+                    ]
+                ));
+
+                return response()->json([
+                    'ok' => true,
+                    'id' => $existing->id,
+                    'duplicate' => true,
+                    'request_id' => $requestId,
+                ], 200);
+            }
+
+            /*
+             * Only store files after dedupe check passes.
+             */
+            if ($request->hasFile('payload')) {
+                /** @var UploadedFile $file */
+                $file = $request->file('payload');
+
+                $name = Str::uuid()->toString() . '__' . ($payloadOriginal ?: 'payload.json');
+                $payloadPath = $this->storeUploadedFileOrFail(
+                    $file,
+                    $dir,
+                    $name,
+                    'payload',
+                    $request,
+                    $requestId
+                );
+
+                $raw = $this->readStoredFileOrFail(
+                    $payloadPath,
+                    'payload',
+                    $request,
+                    $requestId
+                );
+            } else {
+                $name = Str::uuid()->toString() . '__payload.json';
+                $payloadPath = $dir . '/' . $name;
+
+                $this->storeTextContentsOrFail(
+                    $payloadPath,
+                    $raw,
+                    'payload',
+                    $request,
+                    $requestId
+                );
+
+                $raw = $this->readStoredFileOrFail(
+                    $payloadPath,
+                    'payload',
+                    $request,
+                    $requestId
+                );
+            }
 
             $imagePath = null;
             $imageOriginal = null;
@@ -218,12 +276,15 @@ class LoadsController extends Controller
                     'jobname' => $jobname,
                     'payload_path' => $payloadPath,
                     'image_path' => $imagePath,
+                    'incoming_image_size' => $incomingImageSize,
+                    'incoming_image_hash' => $incomingImageHash,
                 ]
             ));
 
             return response()->json([
                 'ok' => true,
                 'id' => $row->id,
+                'duplicate' => false,
                 'request_id' => $requestId,
             ], 201);
         } catch (Throwable $e) {
@@ -243,6 +304,76 @@ class LoadsController extends Controller
                 'request_id' => $requestId,
             ], 500);
         }
+    }
+
+    private function findDuplicateImport(
+        ?string $jobname,
+        string $canonicalPayloadJson,
+        ?string $incomingImageHash,
+        ?int $incomingImageSize
+    ): ?LoadImport {
+        $query = LoadImport::query();
+
+        if ($jobname !== null && $jobname !== '') {
+            $query->where('jobname', $jobname);
+        }
+
+        if ($incomingImageHash === null) {
+            $query->whereNull('image_path');
+        } else {
+            $query->whereNotNull('image_path');
+
+            if ($incomingImageSize !== null) {
+                $query->where('image_size', $incomingImageSize);
+            }
+        }
+
+        $candidates = $query
+            ->latest('id')
+            ->limit(250)
+            ->get();
+
+        foreach ($candidates as $candidate) {
+            $candidateCanonicalPayloadJson = $this->normalizeStoredPayloadForComparison($candidate->payload_json);
+
+            if ($candidateCanonicalPayloadJson !== $canonicalPayloadJson) {
+                continue;
+            }
+
+            if ($incomingImageHash === null) {
+                if (empty($candidate->image_path)) {
+                    return $candidate;
+                }
+
+                continue;
+            }
+
+            if (empty($candidate->image_path)) {
+                continue;
+            }
+
+            $storedImageHash = $this->hashStoredFile($candidate->image_path);
+
+            if ($storedImageHash !== null && hash_equals($storedImageHash, $incomingImageHash)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private function normalizeStoredPayloadForComparison(mixed $value): string
+    {
+        if (is_string($value)) {
+            $normalized = $this->normalizeJsonInput($value);
+            $decoded = json_decode($normalized, true);
+
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $value = $decoded;
+            }
+        }
+
+        return $this->canonicalizeJsonValue($value);
     }
 
     private function storeUploadedFileOrFail(
@@ -437,6 +568,99 @@ class LoadsController extends Controller
         }
     }
 
+    private function readUploadedFileContentsOrFail(
+        UploadedFile $file,
+        string $field,
+        Request $request,
+        string $requestId
+    ): string {
+        $path = $file->getRealPath();
+
+        if (!is_string($path) || $path === '' || !is_file($path)) {
+            Log::error('[loads.push] uploaded file has no readable temp path', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'file' => $this->fileSummary($file),
+                ]
+            ));
+
+            throw new RuntimeException("Uploaded {$field} file is not readable");
+        }
+
+        $contents = @file_get_contents($path);
+
+        if (!is_string($contents)) {
+            Log::error('[loads.push] failed reading uploaded temp file', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'file' => $this->fileSummary($file),
+                    'temp_path' => $path,
+                ]
+            ));
+
+            throw new RuntimeException("Uploaded {$field} file could not be read");
+        }
+
+        return $contents;
+    }
+
+    private function hashUploadedFileOrFail(
+        UploadedFile $file,
+        string $field,
+        Request $request,
+        string $requestId
+    ): string {
+        $path = $file->getRealPath();
+
+        if (!is_string($path) || $path === '' || !is_file($path)) {
+            Log::error('[loads.push] uploaded file has no hashable temp path', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'file' => $this->fileSummary($file),
+                ]
+            ));
+
+            throw new RuntimeException("Uploaded {$field} file is not readable for hashing");
+        }
+
+        $hash = @hash_file('sha256', $path);
+
+        if (!is_string($hash) || $hash === '') {
+            Log::error('[loads.push] failed hashing uploaded file', array_merge(
+                $this->baseLogContext($request, $requestId),
+                [
+                    'field' => $field,
+                    'file' => $this->fileSummary($file),
+                    'temp_path' => $path,
+                ]
+            ));
+
+            throw new RuntimeException("Uploaded {$field} file could not be hashed");
+        }
+
+        return $hash;
+    }
+
+    private function hashStoredFile(string $path): ?string
+    {
+        if (!Storage::disk(self::STORAGE_DISK)->exists($path)) {
+            return null;
+        }
+
+        $absolutePath = Storage::disk(self::STORAGE_DISK)->path($path);
+
+        if (!is_string($absolutePath) || $absolutePath === '' || !is_file($absolutePath)) {
+            return null;
+        }
+
+        $hash = @hash_file('sha256', $absolutePath);
+
+        return is_string($hash) && $hash !== '' ? $hash : null;
+    }
+
     private function normalizeJsonInput(?string $raw): string
     {
         $raw = (string) $raw;
@@ -447,6 +671,45 @@ class LoadsController extends Controller
         }
 
         return $raw;
+    }
+
+    private function canonicalizeJsonValue(mixed $value): string
+    {
+        $normalized = $this->canonicalizeValue($value);
+
+        $json = json_encode($normalized, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+        if (!is_string($json)) {
+            throw new RuntimeException('Failed to canonicalize payload JSON');
+        }
+
+        return $json;
+    }
+
+    private function canonicalizeValue(mixed $value): mixed
+    {
+        if (!is_array($value)) {
+            return $value;
+        }
+
+        if ($this->isAssoc($value)) {
+            ksort($value);
+        }
+
+        foreach ($value as $key => $item) {
+            $value[$key] = $this->canonicalizeValue($item);
+        }
+
+        return $value;
+    }
+
+    private function isAssoc(array $array): bool
+    {
+        if ($array === []) {
+            return false;
+        }
+
+        return array_keys($array) !== range(0, count($array) - 1);
     }
 
     private function baseLogContext(Request $request, string $requestId): array
